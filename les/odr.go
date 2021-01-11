@@ -18,11 +18,12 @@ package les
 
 import (
 	"context"
+	"time"
 
+	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/light"
-	"github.com/ethereum/go-ethereum/log"
 )
 
 // LesOdr implements light.OdrBackend
@@ -81,13 +82,13 @@ func (odr *LesOdr) IndexerConfig() *light.IndexerConfig {
 }
 
 const (
-	MsgBlockBodies = iota
+	MsgBlockHeaders = iota
+	MsgBlockBodies
 	MsgCode
 	MsgReceipts
-	MsgProofsV1
 	MsgProofsV2
-	MsgHeaderProofs
 	MsgHelperTrieProofs
+	MsgTxStatus
 )
 
 // Msg encodes a LES message that delivers reply data for a request
@@ -105,25 +106,33 @@ func (odr *LesOdr) Retrieve(ctx context.Context, req light.OdrRequest) (err erro
 	reqID := genReqID()
 	rq := &distReq{
 		getCost: func(dp distPeer) uint64 {
-			return lreq.GetCost(dp.(*peer))
+			return lreq.GetCost(dp.(*serverPeer))
 		},
 		canSend: func(dp distPeer) bool {
-			p := dp.(*peer)
-			return lreq.CanSend(p)
+			p := dp.(*serverPeer)
+			if !p.onlyAnnounce {
+				return lreq.CanSend(p)
+			}
+			return false
 		},
 		request: func(dp distPeer) func() {
-			p := dp.(*peer)
+			p := dp.(*serverPeer)
 			cost := lreq.GetCost(p)
-			p.fcServer.QueueRequest(reqID, cost)
+			p.fcServer.QueuedRequest(reqID, cost)
 			return func() { lreq.Request(reqID, p) }
 		},
 	}
 
-	if err = odr.retriever.retrieve(ctx, reqID, rq, func(p distPeer, msg *Msg) error { return lreq.Validate(odr.db, msg) }, odr.stop); err == nil {
-		// retrieved from network, store in db
-		req.StoreResult(odr.db)
-	} else {
-		log.Debug("Failed to retrieve data from network", "err", err)
+	defer func(sent mclock.AbsTime) {
+		if err != nil {
+			return
+		}
+		requestRTT.Update(time.Duration(mclock.Now() - sent))
+	}(mclock.Now())
+
+	if err := odr.retriever.retrieve(ctx, reqID, rq, func(p distPeer, msg *Msg) error { return lreq.Validate(odr.db, msg) }, odr.stop); err != nil {
+		return err
 	}
-	return
+	req.StoreResult(odr.db)
+	return nil
 }
